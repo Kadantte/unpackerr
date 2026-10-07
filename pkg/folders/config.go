@@ -1,0 +1,132 @@
+// Package folders watches configured paths for archives to extract.
+package folders
+
+import (
+	"os"
+	"time"
+
+	"github.com/Unpackerr/unpackerr/pkg/extract"
+	"github.com/fsnotify/fsnotify"
+	"github.com/radovskyb/watcher"
+	"golift.io/cnfg"
+	"golift.io/xtractr"
+)
+
+const (
+	MinimumPollInterval = 5 * time.Millisecond
+	DefaultDeleteAfter  = 10 * time.Minute
+	KindPolling         = "polling"
+	KindFSNotify        = "fsnotify"
+)
+
+// FolderConfig defines the input data for a watched folder.
+//
+//nolint:lll
+type FolderConfig struct {
+	DeleteOrig       bool           `json:"delete_original"  toml:"delete_original"   xml:"delete_original"   yaml:"delete_original"`
+	DeleteFiles      bool           `json:"delete_files"     toml:"delete_files"      xml:"delete_files"      yaml:"delete_files"`
+	DisableLog       bool           `json:"disable_log"      toml:"disable_log"       xml:"disable_log"       yaml:"disable_log"`
+	MoveBack         bool           `json:"move_back"        toml:"move_back"         xml:"move_back"         yaml:"move_back"`
+	DeleteAfter      *cnfg.Duration `json:"delete_after"     toml:"delete_after"      xml:"delete_after"      yaml:"delete_after"`
+	ExtractPath      string         `json:"extract_path"     toml:"extract_path"      xml:"extract_path"      yaml:"extract_path"`
+	ExtractISOs      bool           `json:"extract_isos"     toml:"extract_isos"      xml:"extract_isos"      yaml:"extract_isos"`
+	DisableRecursion bool           `json:"disableRecursion" toml:"disable_recursion" xml:"disable_recursion" yaml:"disableRecursion"`
+	MaxNested        int            `json:"maxNested"        toml:"max_nested"        xml:"max_nested"        yaml:"maxNested"`
+	ExtrasMaxDepth   int            `json:"extrasMaxDepth"   toml:"extras_max_depth"  xml:"extras_max_depth"  yaml:"extrasMaxDepth"`
+	AllowSymlinks    bool           `json:"allowSymlinks"    toml:"allow_symlinks"    xml:"allow_symlinks"    yaml:"allowSymlinks"`
+	MaxBytes         string         `json:"maxBytes"         toml:"max_bytes"         xml:"max_bytes"         yaml:"maxBytes"`
+	MaxFiles         int            `json:"maxFiles"         toml:"max_files"         xml:"max_files"         yaml:"maxFiles"`
+	MaxRatio         float64        `json:"maxRatio"         toml:"max_ratio"         xml:"max_ratio"         yaml:"maxRatio"`
+	// ResolvedMaxBytes is 0 when unset: folder watcher is uncapped.
+	ResolvedMaxBytes uint64        `json:"-"               toml:"-"               xml:"-"              yaml:"-"`
+	ExcludePaths     []string      `json:"exclude_paths"   toml:"exclude_paths"   xml:"exclude_path"   yaml:"exclude_paths"`
+	Interval         cnfg.Duration `json:"interval"        toml:"interval"        xml:"interval"       yaml:"interval"`
+	WaitExtensions   []string      `json:"wait_extensions" toml:"wait_extensions" xml:"wait_extension" yaml:"wait_extensions"`
+	SkipEmpty        bool          `json:"skip_empty"      toml:"skip_empty"      xml:"skip_empty"     yaml:"skip_empty"`
+	Path             string        `json:"path"            toml:"path"            xml:"path"           yaml:"path"`
+}
+
+// UsesPoller is true when this folder has its own radovskyb poller.
+func (c *FolderConfig) UsesPoller() bool {
+	return c != nil && c.Interval.Duration >= MinimumPollInterval
+}
+
+// WatchConfig is the undocumented folders event-buffer setting.
+type WatchConfig struct {
+	Buffer uint `json:"buffer" toml:"buffer" xml:"buffer" yaml:"buffer"`
+}
+
+// folderPoller is one radovskyb watcher for a single watch path.
+type folderPoller struct {
+	path     string
+	interval time.Duration
+	watcher  *watcher.Watcher
+}
+
+// Folders holds all known (created) folders in all watch paths.
+type Folders struct {
+	Logs
+	Config       []*FolderConfig
+	Folders      map[string]*Folder
+	Events       chan *Event
+	Updates      chan *xtractr.Response
+	FSNotify     *fsnotify.Watcher
+	pollers      []*folderPoller
+	IgnoreSuffix string
+}
+
+// Logs interface for folders.
+type Logs interface {
+	Printf(msg string, v ...any)
+	Errorf(msg string, v ...any)
+	Debugf(msg string, v ...any)
+}
+
+// Folder is a tracked archive or directory inside a watch path.
+type Folder struct {
+	// Updated is last write or status change. Start delay, retry delay,
+	// delete after, and the wait-extension ReadDir skip all use this.
+	Updated time.Time
+	// WaitFile is a top-level name matching wait_extensions (.part, etc).
+	// Empty means extraction is not blocked on an incomplete download.
+	WaitFile string
+	// Status is the extract lifecycle for this item.
+	Status extract.Status
+	// Config is the watch-root settings this item belongs to.
+	Config *FolderConfig
+	// Files are extracted output paths (xtractr NewFiles). Used with delete_files.
+	Files []string
+	// Retries is how many times a failed extract has been started again.
+	Retries uint
+	// Archives are the input archives xtractr found. Used with delete_original.
+	Archives xtractr.ArchiveList
+	// PreFiles is the snapshot of each archive dest before extraction
+	// (MoveBack only). Dest folders come from FindCompressedFiles so nested
+	// archive dirs are included. Kept across retries so failed cleanups are
+	// not recaptured as download content. Nil means remnant handling is skipped.
+	PreFiles map[string]os.FileInfo
+	// NoRetry is set when remnant_action=off leaves a blocker.
+	NoRetry bool
+}
+
+// Event is a filesystem event for a watched folder.
+type Event struct {
+	Config *FolderConfig
+	Name   string
+	File   string
+	Op     string
+}
+
+// Kind is "polling" or "fsnotify" from the event prefix (w vs f).
+func (e *Event) Kind() string {
+	switch {
+	default:
+		fallthrough
+	case e == nil || e.Op == "":
+		return ""
+	case e.Op[0] == 'w':
+		return KindPolling
+	case e.Op[0] == 'f':
+		return KindFSNotify
+	}
+}

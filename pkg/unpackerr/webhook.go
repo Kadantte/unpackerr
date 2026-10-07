@@ -1,106 +1,61 @@
 package unpackerr
 
 import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"maps"
 	"runtime"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
 
+	"github.com/Unpackerr/unpackerr/pkg/extract"
+	"github.com/Unpackerr/unpackerr/pkg/hooks"
 	"golift.io/cnfg"
 	"golift.io/starr"
 	"golift.io/version"
 )
 
-// WebhookConfig defines the data to send webhooks to a server.
-type WebhookConfig struct {
-	Name       string          `json:"name"         toml:"name"          xml:"name"                    yaml:"name"`
-	URL        string          `json:"url"          toml:"url"           xml:"url,omitempty"           yaml:"url"`
-	Command    string          `json:"command"      toml:"command"       xml:"command,omitempty"       yaml:"command"`
-	CType      string          `json:"contentType"  toml:"content_type"  xml:"content_type,omitempty"  yaml:"contentType"`
-	TmplPath   string          `json:"templatePath" toml:"template_path" xml:"template_path,omitempty" yaml:"templatePath"`
-	TempName   string          `json:"template"     toml:"template"      xml:"template,omitempty"      yaml:"template"`
-	Timeout    cnfg.Duration   `json:"timeout"      toml:"timeout"       xml:"timeout"                 yaml:"timeout"`
-	Shell      bool            `json:"shell"        toml:"shell"         xml:"shell"                   yaml:"shell"`
-	IgnoreSSL  bool            `json:"ignoreSsl"    toml:"ignore_ssl"    xml:"ignore_ssl,omitempty"    yaml:"ignoreSsl"`
-	Silent     bool            `json:"silent"       toml:"silent"        xml:"silent"                  yaml:"silent"`
-	Events     ExtractStatuses `json:"events"       toml:"events"        xml:"events"                  yaml:"events"`
-	Exclude    StringSlice     `json:"exclude"      toml:"exclude"       xml:"exclude"                 yaml:"exclude"`
-	Nickname   string          `json:"nickname"     toml:"nickname"      xml:"nickname,omitempty"      yaml:"nickname"`
-	Token      string          `json:"token"        toml:"token"         xml:"token,omitempty"         yaml:"token"`
-	Channel    string          `json:"channel"      toml:"channel"       xml:"channel,omitempty"       yaml:"channel"`
-	client     *http.Client
-	fails      uint
-	posts      uint
-	sync.Mutex `json:"-" toml:"-" xml:"-" yaml:"-"`
-}
-
-type hookQueueItem struct {
-	*WebhookConfig
-	*WebhookPayload
-}
-
-// Errors produced by this file.
-var (
-	ErrInvalidStatus = errors.New("invalid HTTP status reply")
-	ErrWebhookNoURL  = errors.New("webhook without a URL configured; fix it")
-)
-
-// ExtractStatuses allows us to create a custom environment variable unmarshaller.
-type ExtractStatuses []ExtractStatus
-
-// UnmarshalENV turns environment variables into extraction statuses.
-func (statuses *ExtractStatuses) UnmarshalENV(tag, envval string) error {
-	if envval == "" {
-		return nil
-	}
-
-	envval = strings.Trim(envval, `["',] `)
-	vals := strings.Split(envval, ",")
-	*statuses = make(ExtractStatuses, len(vals))
-
-	for idx, val := range vals {
-		intVal, err := strconv.ParseUint(strings.TrimSpace(val), 10, 8)
-		if err != nil {
-			return fmt.Errorf("converting tag %s value '%s' to number: %w", tag, envval, err)
-		}
-
-		(*statuses)[idx] = ExtractStatus(intVal)
-	}
-
-	return nil
-}
-
-func (statuses *ExtractStatuses) MarshalENV(tag string) (map[string]string, error) {
-	vals := make([]string, len(*statuses))
-
-	for idx, status := range *statuses {
-		vals[idx] = status.String()
-	}
-
-	return map[string]string{tag: strings.Join(vals, ",")}, nil
-}
-
-// runAllHooks sends webhooks and executes command hooks.
-func (u *Unpackerr) runAllHooks(item *Extract) {
-	if item.Status == IMPORTED && item.App == FolderString {
+func (u *Unpackerr) runAllHooks(itemID string, item, live *Extract) {
+	if item == nil || (item.Status == IMPORTED && item.App == FolderString) {
 		return // This is an internal state change we don't need to fire on.
 	}
 
-	payload := &WebhookPayload{
-		Path:  item.Path,
-		App:   item.App,
-		IDs:   item.IDs,
-		Time:  item.Updated,
-		Data:  nil,
-		Event: item.Status,
+	u.seedHookMessages(itemID, item.HookMessages, live)
+
+	payload := u.hookPayload(item)
+
+	for _, entry := range u.hookEntries() {
+		hook := entry.Val
+		if hook.HasEvent(item.Status) && !hook.Excluded(item.App, item.Name) {
+			u.queueHook(itemID, entry.Key, live, &hooks.Item{Config: hook, Payload: payload})
+		}
+	}
+
+	for _, entry := range u.cmdhookEntries() {
+		hook := entry.Val
+		if hook.HasEvent(item.Status) && !hook.Excluded(item.App, item.Name) {
+			u.queueHook(itemID, entry.Key, live, &hooks.Item{Config: hook, Payload: payload})
+		}
+	}
+}
+
+func (u *Unpackerr) hookExtras() (map[string]string, HookTitles) {
+	u.configMu.RLock()
+	defer u.configMu.RUnlock()
+
+	return maps.Clone(u.Hooks.CustomIDs), u.Hooks.Titles
+}
+
+func (u *Unpackerr) hookPayload(item *Extract) *hooks.Payload {
+	global, titles := u.hookExtras()
+
+	payload := &hooks.Payload{
+		Path:       item.Path,
+		App:        starr.App(item.Label()),
+		IDs:        cloneIDs(item.IDs),
+		CustomIDs:  payloadCustomIDs(global),
+		Time:       item.Updated,
+		Data:       nil,
+		Event:      item.Status,
+		Retries:    item.Retries,
+		EventTitle: titles.forStatus(item.Status),
 		// Application Metadata.
 		Go:       runtime.Version(),
 		OS:       runtime.GOOS,
@@ -111,9 +66,9 @@ func (u *Unpackerr) runAllHooks(item *Extract) {
 		Started:  version.Started,
 	}
 
-	if item.Status <= EXTRACTED && item.Resp != nil {
-		payload.Data = &XtractPayload{
-			Files:   item.Resp.NewFiles,
+	if item.Resp != nil {
+		payload.Data = &hooks.XtractPayload{
+			Files:   hooks.StringSlice(item.Resp.NewFiles),
 			File:    item.Resp.NewFiles,
 			Start:   item.Resp.Started,
 			Output:  item.Resp.Output,
@@ -137,251 +92,448 @@ func (u *Unpackerr) runAllHooks(item *Extract) {
 		}
 	}
 
-	for _, hook := range u.hookList() {
-		if hook.HasEvent(item.Status) && !hook.Excluded(item.App) {
-			u.queueHook(&hookQueueItem{WebhookConfig: hook, WebhookPayload: payload})
-		}
-	}
-
-	for _, hook := range u.cmdhookList() {
-		if hook.HasEvent(item.Status) && !hook.Excluded(item.App) {
-			u.queueHook(&hookQueueItem{WebhookConfig: hook, WebhookPayload: payload})
-		}
-	}
+	return payload
 }
 
-func (u *Unpackerr) sendWebhookWithLog(hook *WebhookConfig, payload *WebhookPayload) {
-	var body bytes.Buffer
-
-	if tmpl, err := hook.Template(); err != nil {
-		u.Errorf("Webhook Template (%s = %s): %v", payload.Path, payload.Event, err)
-		return
-	} else if err = tmpl.Execute(&body, payload); err != nil {
-		u.Errorf("Webhook Payload (%s = %s): %v", payload.Path, payload.Event, err)
+func (u *Unpackerr) decorateSamplePayload(payload *hooks.Payload, event extract.Status) {
+	if payload == nil {
 		return
 	}
 
-	bodyStr := body.String()
+	u.configMu.RLock()
+	global := maps.Clone(u.Hooks.CustomIDs)
+	titles := u.Hooks.Titles
+	u.configMu.RUnlock()
 
-	if reply, err := hook.Send(&body); err != nil {
-		u.Debugf("Webhook Payload: %s", bodyStr)
-		u.Errorf("Webhook (%s = %s): %s: %v", payload.Path, payload.Event, hook.Name, err)
-		u.Debugf("Webhook Response: %s", string(reply))
-	} else if !hook.Silent {
-		u.Debugf("Webhook Payload: %s", bodyStr)
-		u.Printf("[Webhook] Posted Payload (%s = %s): %s: OK", payload.Path, payload.Event, hook.Name)
-	}
+	payload.EventTitle = titles.forStatus(event)
+	payload.CustomIDs = payloadCustomIDs(global)
 }
 
-// Send marshals an any into json and POSTs it to a URL.
-func (w *WebhookConfig) Send(body io.Reader) ([]byte, error) {
-	if w.URL == "" {
-		return nil, ErrWebhookNoURL
-	}
-
-	w.Lock()
-	defer w.Unlock()
-
-	w.posts++
-
-	ctx, cancel := context.WithTimeout(context.Background(), w.Timeout.Duration+time.Second)
-	defer cancel()
-
-	resp, err := w.send(ctx, body)
-	if err != nil {
-		w.fails++
-	}
-
-	return resp, err
-}
-
-func (w *WebhookConfig) send(ctx context.Context, body io.Reader) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, body)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", w.CType)
-
-	res, err := w.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("POSTing payload: %w", err)
-	}
-	defer res.Body.Close()
-
-	// The error is mostly ignored because we don't care about the body.
-	// Read it in to avoid a memopry leak. Used in the if-stanza below.
-	reply, _ := io.ReadAll(res.Body)
-
-	if res.StatusCode < http.StatusOK || res.StatusCode > http.StatusNoContent {
-		return nil, fmt.Errorf("%w (%s): %s", ErrInvalidStatus, res.Status, reply)
-	}
-
-	return reply, nil
-}
-
-func (u *Unpackerr) hookList() []*WebhookConfig {
+func (u *Unpackerr) hookList() []*hooks.Config {
 	u.configMu.RLock()
 	defer u.configMu.RUnlock()
 
-	return u.Webhook
+	return instanceValues(u.Webhook)
 }
 
-func (u *Unpackerr) cmdhookList() []*WebhookConfig {
+func (u *Unpackerr) hookEntries() []instanceEntry[WebhookConfig] {
 	u.configMu.RLock()
 	defer u.configMu.RUnlock()
 
-	return u.Cmdhook
+	return instanceEntries(u.Webhook)
+}
+
+func (u *Unpackerr) cmdhookList() []*hooks.Config {
+	u.configMu.RLock()
+	defer u.configMu.RUnlock()
+
+	return instanceValues(u.Cmdhook)
+}
+
+func (u *Unpackerr) cmdhookEntries() []instanceEntry[WebhookConfig] {
+	u.configMu.RLock()
+	defer u.configMu.RUnlock()
+
+	return instanceEntries(u.Cmdhook)
 }
 
 func (u *Unpackerr) validateWebhook() error {
 	return u.validateWebhookList(u.Webhook)
 }
 
-func (u *Unpackerr) validateWebhookList(list []*WebhookConfig) error { //nolint:cyclop
-	for idx := range list {
-		if list[idx] == nil {
-			return errNilConfigEntry
+func (u *Unpackerr) validateWebhookList(list InstanceMap[WebhookConfig]) error {
+	for key := range list {
+		if err := validateInstanceSlug(key); err != nil {
+			return err
 		}
+	}
 
-		list[idx].Command = ""
-
-		if list[idx].URL == "" {
-			return ErrWebhookNoURL
-		}
-
-		if list[idx].Name == "" {
-			list[idx].Name = list[idx].URL
-		}
-
-		if list[idx].Nickname == "" && list[idx].TmplPath == "" &&
-			!strings.Contains(list[idx].URL, "pushover.net") {
-			list[idx].Nickname = "Unpackerr"
-		}
-
-		if list[idx].CType == "" {
-			list[idx].CType = "application/json"
-			if strings.Contains(list[idx].URL, "pushover.net") {
-				list[idx].CType = "application/x-www-form-urlencoded"
-			}
-		}
-
-		if list[idx].Timeout.Duration == 0 {
-			list[idx].Timeout.Duration = u.Timeout.Duration
-		}
-
-		if len(list[idx].Events) == 0 {
-			list[idx].Events = []ExtractStatus{WAITING}
-		}
-
-		if list[idx].client == nil {
-			list[idx].client = &http.Client{
-				Timeout: list[idx].Timeout.Duration,
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: list[idx].IgnoreSSL, //nolint:gosec
-				}},
-			}
-		}
+	if err := hooks.ValidateWebhooks(instanceValues(list), u.Timeout.Duration); err != nil {
+		return fmt.Errorf("validating webhooks: %w", err)
 	}
 
 	return nil
 }
 
-func (u *Unpackerr) logWebhook() {
-	var vars, prefix string
-
-	if len(u.Webhook) == 1 {
-		prefix = " => Webhook Config: 1 URL"
-	} else {
-		u.Printf(" => Webhook Configs: %d URLs", len(u.Webhook))
-		prefix = " =>    URL" //nolint:wsl_v5
-	}
-
-	for _, hook := range u.Webhook {
-		if vars = ""; hook.TmplPath != "" {
-			vars = ", template: " + hook.TmplPath + ", content_type: " + hook.CType
-		}
-
-		if hook.Channel != "" {
-			vars += ", channel: " + hook.Channel
-		}
-
-		if hook.Nickname != "" {
-			vars += ", nickname: " + hook.Nickname
-		}
-
-		if len(hook.Exclude) > 0 {
-			vars += ", exclude: \"" + strings.Join(hook.Exclude, "; ") + `"`
-		}
-
-		u.Printf("%s: %s, timeout: %v, ignore ssl: %v, silent: %v%s, events: %q",
-			prefix, hook.Name, hook.Timeout, hook.IgnoreSSL, hook.Silent, vars, logEvents(hook.Events))
-	}
+func (u *Unpackerr) validateCmdhook() error {
+	return u.validateCmdhookList(u.Cmdhook)
 }
 
-// logEvents is only used in logWebhook to format events for printing.
-func logEvents(events []ExtractStatus) string {
-	if len(events) == 1 && events[0] == WAITING {
-		return "all"
-	}
-
-	var output string
-
-	for _, event := range events {
-		if len(output) > 0 {
-			output += "; "
-		}
-
-		output += event.String()
-	}
-
-	return output
-}
-
-// Excluded returns true if an app is in the Exclude slice.
-func (w *WebhookConfig) Excluded(app starr.App) bool {
-	for _, exclude := range w.Exclude {
-		if strings.EqualFold(exclude, string(app)) {
-			return true
+func (u *Unpackerr) validateCmdhookList(list InstanceMap[WebhookConfig]) error {
+	for key := range list {
+		if err := validateInstanceSlug(key); err != nil {
+			return err
 		}
 	}
 
-	return false
-}
-
-// HasEvent returns true if a status event is in the Events slice.
-// Also returns true if the Events slice has only one value of WAITING.
-func (w *WebhookConfig) HasEvent(e ExtractStatus) bool {
-	for _, status := range w.Events {
-		if (status == WAITING && len(w.Events) == 1) || status == e {
-			return true
-		}
+	if err := hooks.ValidateCmdhooks(instanceValues(list), u.Timeout.Duration, expandHomedir); err != nil {
+		return fmt.Errorf("validating cmdhooks: %w", err)
 	}
 
-	return false
+	return nil
 }
 
 // WebhookCounts returns the total count of requests and errors for all webhooks.
 func (u *Unpackerr) WebhookCounts() (uint, uint) {
-	var total, fails uint
+	return hooks.CountAll(u.hookList())
+}
 
-	for _, hook := range u.hookList() {
-		if hook == nil {
+// CmdhookCounts returns the total count of requests and errors for all command hooks.
+func (u *Unpackerr) CmdhookCounts() (uint, uint) {
+	return hooks.CountAll(u.cmdhookList())
+}
+
+// reportHookFail queues a failure for the main loop. Done runs on the hook
+// worker and must not read live Config or mutate Map.
+func (u *Unpackerr) reportHookFail(itemID string) {
+	if itemID == "" {
+		return
+	}
+
+	u.hookFailMu.Lock()
+	u.hookFails = append(u.hookFails, itemID)
+	u.hookFailMu.Unlock()
+
+	select {
+	case u.hookFailWake <- struct{}{}:
+	default:
+	}
+}
+
+func (u *Unpackerr) hasPendingHookFails() bool {
+	u.hookFailMu.Lock()
+	defer u.hookFailMu.Unlock()
+
+	return len(u.hookFails) > 0
+}
+
+func (u *Unpackerr) drainHookFails() {
+	u.hookFailMu.Lock()
+	ids := u.hookFails
+	u.hookFails = nil
+	u.hookFailMu.Unlock()
+
+	for _, itemID := range ids {
+		u.recordHookFail(itemID)
+	}
+}
+
+// recordHookFail increments the per-extract hook-failure counter.
+// itemID is the Map key and history record ID (Starr title or folder path).
+// Call from the main loop only.
+func (u *Unpackerr) recordHookFail(itemID string) {
+	if itemID == "" {
+		return
+	}
+
+	u.lockHistory()
+
+	item := u.Map[itemID]
+	if item != nil {
+		item.HookFail++
+		u.maybeRecordHistory(itemID, item)
+
+		if u.hub != nil {
+			u.hub.notifyProgress(u.queueFromExtract(itemID, item))
+		}
+
+		persistable := isPersistedHistory(item)
+
+		u.History.unlockHistory()
+
+		if !persistable {
+			u.bumpHistoryHookFail(itemID)
+		}
+
+		return
+	}
+
+	u.History.unlockHistory()
+	u.bumpHistoryHookFail(itemID)
+}
+
+func (u *Unpackerr) bumpHistoryHookFail(itemID string) {
+	if u.KeepHistory == 0 {
+		return
+	}
+
+	u.histMu.Lock()
+	defer u.histMu.Unlock()
+
+	for _, row := range u.records {
+		if row.ID != itemID {
 			continue
 		}
 
-		posts, failures := hook.Counts()
-		total += posts
-		fails += failures
-	}
+		rec := row
+		rec.HookFail++
+		u.upsertHistoryLocked(rec)
 
-	return total, fails
+		return
+	}
 }
 
-// Counts returns the total count of requests and failures for a webhook.
-func (w *WebhookConfig) Counts() (uint, uint) {
-	w.Lock()
-	defer w.Unlock()
+type hookMsgSave struct {
+	itemID, key, msgID string
+	live               *Extract
+}
 
-	return w.posts, w.fails
+type hookMsgCache struct {
+	live *Extract
+	msgs map[string]string
+}
+
+func hookMsgsMap(msgs map[string]string) map[string]string {
+	cloned := maps.Clone(msgs)
+	if cloned == nil {
+		return map[string]string{}
+	}
+
+	return cloned
+}
+
+func (c *hookMsgCache) ownedBy(live *Extract) bool {
+	return c != nil && (live == nil || c.live == nil || c.live == live)
+}
+
+// seedHookMessages copies restored ids into the worker-visible cache for live.
+// A different live extract replaces the cache so a reused title/path cannot
+// edit the previous extract's Discord/Telegram message. Existing keys win so a
+// FIFO SaveID is not overwritten by a stale snapshot of the same extract.
+func (u *Unpackerr) seedHookMessages(itemID string, msgs map[string]string, live *Extract) {
+	if itemID == "" {
+		return
+	}
+
+	u.hookMsgMu.Lock()
+	defer u.hookMsgMu.Unlock()
+
+	if u.hookMsgs == nil {
+		u.hookMsgs = map[string]*hookMsgCache{}
+	}
+
+	cache := u.hookMsgs[itemID]
+	if !cache.ownedBy(live) {
+		u.hookMsgs[itemID] = &hookMsgCache{live: live, msgs: hookMsgsMap(msgs)}
+
+		return
+	}
+
+	if cache.live == nil {
+		cache.live = live
+	}
+
+	if cache.msgs == nil {
+		cache.msgs = map[string]string{}
+	}
+
+	for key, msgID := range msgs {
+		if msgID == "" {
+			continue
+		}
+
+		if _, ok := cache.msgs[key]; !ok {
+			cache.msgs[key] = msgID
+		}
+	}
+}
+
+func (u *Unpackerr) lookupHookMessage(itemID, key string, live *Extract) string {
+	if itemID == "" || key == "" {
+		return ""
+	}
+
+	u.hookMsgMu.Lock()
+	defer u.hookMsgMu.Unlock()
+
+	cache := u.hookMsgs[itemID]
+	if !cache.ownedBy(live) || cache.msgs == nil {
+		return ""
+	}
+
+	return cache.msgs[key]
+}
+
+// storeHookMessage records an id for the next FIFO LookupID, then wakes the
+// main loop to persist Map/history. SaveID runs on the hook worker.
+func (u *Unpackerr) storeHookMessage(itemID, key, msgID string, live *Extract) {
+	if itemID == "" || key == "" || msgID == "" {
+		return
+	}
+
+	u.hookMsgMu.Lock()
+
+	if u.hookMsgs == nil {
+		u.hookMsgs = map[string]*hookMsgCache{}
+	}
+
+	cache := u.hookMsgs[itemID]
+	if cache != nil && !cache.ownedBy(live) {
+		u.hookMsgMu.Unlock()
+
+		return
+	}
+
+	if cache == nil {
+		cache = &hookMsgCache{live: live, msgs: map[string]string{}}
+		u.hookMsgs[itemID] = cache
+	} else if cache.live == nil {
+		cache.live = live
+	}
+
+	if cache.msgs == nil {
+		cache.msgs = map[string]string{}
+	}
+
+	cache.msgs[key] = msgID
+	u.hookMsgSaves = append(u.hookMsgSaves, hookMsgSave{
+		itemID: itemID, key: key, msgID: msgID, live: live,
+	})
+	u.hookMsgMu.Unlock()
+
+	select {
+	case u.hookMsgWake <- struct{}{}:
+	default:
+	}
+}
+
+func (u *Unpackerr) dropHookMessages(itemID string, live *Extract) {
+	if itemID == "" {
+		return
+	}
+
+	u.hookMsgMu.Lock()
+	defer u.hookMsgMu.Unlock()
+
+	if cache := u.hookMsgs[itemID]; cache.ownedBy(live) {
+		delete(u.hookMsgs, itemID)
+	}
+}
+
+func (u *Unpackerr) hasPendingHookMessages() bool {
+	u.hookMsgMu.Lock()
+	defer u.hookMsgMu.Unlock()
+
+	return len(u.hookMsgSaves) > 0
+}
+
+func (u *Unpackerr) drainHookMessages() {
+	u.hookMsgMu.Lock()
+	saves := u.hookMsgSaves
+	u.hookMsgSaves = nil
+	u.hookMsgMu.Unlock()
+
+	for _, save := range saves {
+		u.saveHookMessage(save.itemID, save.key, save.msgID, save.live)
+	}
+}
+
+func (u *Unpackerr) hookMessage(itemID, key string) string {
+	if itemID == "" || key == "" {
+		return ""
+	}
+
+	u.lockHistory()
+
+	item := u.Map[itemID]
+	if item != nil && item.HookMessages != nil {
+		id := item.HookMessages[key]
+
+		u.History.unlockHistory()
+
+		return id
+	}
+
+	u.History.unlockHistory()
+
+	return u.historyHookMessage(itemID, key)
+}
+
+func (u *Unpackerr) historyHookMessage(itemID, key string) string {
+	u.histMu.Lock()
+	defer u.histMu.Unlock()
+
+	for _, row := range u.records {
+		if row.ID != itemID || row.HookMessages == nil {
+			continue
+		}
+
+		return row.HookMessages[key]
+	}
+
+	return ""
+}
+
+func (u *Unpackerr) saveHookMessage(itemID, key, msgID string, live *Extract) {
+	if itemID == "" || key == "" || msgID == "" {
+		return
+	}
+
+	u.lockHistory()
+
+	item := u.Map[itemID]
+	if item != nil && (live == nil || item == live) {
+		if item.HookMessages == nil {
+			item.HookMessages = map[string]string{}
+		}
+
+		item.HookMessages[key] = msgID
+		u.maybeRecordHistory(itemID, item)
+
+		u.History.unlockHistory()
+
+		return
+	}
+
+	u.History.unlockHistory()
+
+	if live != nil && item != nil {
+		return // itemID was reused by a newer extract.
+	}
+
+	u.bumpHistoryHookMessage(itemID, key, msgID)
+}
+
+func (u *Unpackerr) bumpHistoryHookMessage(itemID, key, msgID string) {
+	if u.KeepHistory == 0 {
+		return
+	}
+
+	u.histMu.Lock()
+	defer u.histMu.Unlock()
+
+	for _, row := range u.records {
+		if row.ID != itemID {
+			continue
+		}
+
+		rec := row
+		if rec.HookMessages == nil {
+			rec.HookMessages = map[string]string{}
+		} else {
+			rec.HookMessages = maps.Clone(rec.HookMessages)
+		}
+
+		rec.HookMessages[key] = msgID
+		u.upsertHistoryLocked(rec)
+
+		return
+	}
+}
+
+func (u *Unpackerr) sampleWebhook(event extract.Status) error {
+	u.Printf("Sending sample webhooks and exiting! (-w %d passed)", event)
+
+	payload := hooks.SamplePayload()
+	if err := hooks.PrepareSample(payload, event); err != nil {
+		return fmt.Errorf("preparing sample webhook: %w", err)
+	}
+
+	u.decorateSamplePayload(payload, event)
+
+	for _, hook := range instanceValues(u.Webhook) {
+		_ = hooks.SendWithLog(u.Logger, hook, payload)
+	}
+
+	return nil
 }

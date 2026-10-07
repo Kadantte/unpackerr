@@ -1,0 +1,74 @@
+package extract
+
+import (
+	"os"
+	"strings"
+	"time"
+
+	"golift.io/starr"
+	"golift.io/xtractr"
+)
+
+// Extract holds data for files being extracted.
+type Extract struct {
+	Syncthing bool
+	// SplitFlac splits FLAC and APE images referenced by a CUE sheet.
+	SplitFlac bool
+	// APEFormat is ape, wav, or flac. Empty means ape.
+	APEFormat xtractr.AudioFormat
+	// APECompression is the Monkey's Audio level used when APEFormat is ape.
+	// A default of 0 is set to 2000.
+	APECompression int
+	Retries        uint
+	// HookFail is how many webhook or command-hook deliveries failed for this extract.
+	HookFail uint
+	// HookMessages maps webhook/cmdhook instance slug to Discord message id or Telegram message_id.
+	HookMessages map[string]string
+	Path         string // Local path (resolved for extraction on this host).
+	OutputPath   string // Original path from Starr app (may be UNC/remote — used for ManualImport).
+	App          starr.App
+	// Name is an optional Starr instance label for logs, hooks, and the dashboard.
+	// Empty uses App (Sonarr, Radarr, Folder, …). App stays the dialect for logic.
+	Name        string
+	URL         string
+	Updated     time.Time
+	DeleteDelay time.Duration
+	DeleteOrig  bool
+	Status      Status
+	// Due is the next status-timer deadline. The main loop stamps it so HTTP
+	// queue snapshots do not read live config or the folder tracker.
+	Due     time.Time
+	DueKind string
+	IDs     map[string]any
+	Resp    *xtractr.Response
+	XProg   *Progress
+	// Note is a short waiting-state caption for the live queue (e.g. no archives yet).
+	Note string
+	// Event is how an item arrived: fsnotify, polling, later manual. Starr omits it for now.
+	Event string
+	// PreFiles maps cleaned full paths present in each archive dest before
+	// extraction to their Lstat info (nil when the stat failed). Dest folders
+	// come from FindCompressedFiles so nested archive dirs are included.
+	// Snapshot once per queue item; retries must not fold in leftovers that
+	// failed to clear.
+	PreFiles map[string]os.FileInfo
+	// NoRetry is set for limit errors, remnant_action=off, or exhausted retries.
+	// EXTRACTFAILED must not re-enter the retry loop or be promoted to DELETED
+	// (that bounces a still-completed Starr item back to WAITING).
+	NoRetry bool
+	// MaxBytes is the resolved byte cap for this Starr item (0 = unlimited).
+	MaxBytes uint64
+}
+
+// Label is the human-facing instance name, or the dialect when Name is empty.
+func (e *Extract) Label() string {
+	if e == nil {
+		return ""
+	}
+
+	if name := strings.TrimSpace(e.Name); name != "" {
+		return name
+	}
+
+	return string(e.App)
+}

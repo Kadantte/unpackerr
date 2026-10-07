@@ -26,17 +26,51 @@ func TestIdleBlocksOnInFlightWork(t *testing.T) {
 	}
 
 	delete(unpack.Map, "/dl/busy")
-	unpack.folders.Folders["/watch/x"] = &Folder{status: EXTRACTING}
+	unpack.folders.Folders["/watch/x"] = &Folder{Status: EXTRACTING}
 
 	if unpack.idle() {
 		t.Fatal("an extracting folder must block a restart")
 	}
 
-	unpack.folders.Folders["/watch/x"].status = WAITING
+	unpack.folders.Folders["/watch/x"].Status = WAITING
 	unpack.queueDelete(&fileDeleteReq{})
 
 	if unpack.idle() {
 		t.Fatal("a pending delete must block a restart")
+	}
+}
+
+func TestIdleBlocksOnPendingHookFails(t *testing.T) {
+	t.Parallel()
+
+	unpack := New()
+	unpack.reportHookFail("Show A")
+
+	if unpack.idle() {
+		t.Fatal("queued hook failures must block a restart")
+	}
+
+	unpack.drainHookFails()
+
+	if !unpack.idle() {
+		t.Fatal("drained hook failures must not block")
+	}
+}
+
+func TestIdleBlocksOnPendingHookMessages(t *testing.T) {
+	t.Parallel()
+
+	unpack := New()
+	unpack.storeHookMessage("Show A", "discord-1", "msg-1", nil)
+
+	if unpack.idle() {
+		t.Fatal("queued hook message ids must block a restart")
+	}
+
+	unpack.drainHookMessages()
+
+	if !unpack.idle() {
+		t.Fatal("drained hook message ids must not block")
 	}
 }
 

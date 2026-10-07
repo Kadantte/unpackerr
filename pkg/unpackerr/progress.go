@@ -1,12 +1,8 @@
 package unpackerr
 
 import (
-	"fmt"
-	"path/filepath"
-	"strings"
 	"time"
 
-	"code.cloudfoundry.org/bytefmt"
 	"golift.io/xtractr"
 )
 
@@ -15,35 +11,19 @@ const (
 	defaultProgressInterval = 15 * time.Second
 )
 
-// ExtractProgress holds the progress for an entire Extract.
-// An Extract is "a new item in a watch folder" or "a download in a starr app".
-// Either may produce multiple xtractr.XFile structs (extractable archives).
-type ExtractProgress struct {
-	*xtractr.Progress
-	// Extract that exists in the map.
-	*Extract
-	// Number of archives in this Extract.
-	Archives int
-	// Number of archives extracted from this Extract.
-	Extracted int
-}
-
-func (p *ExtractProgress) String() string {
-	if p == nil || p.Progress == nil {
-		return "no progress yet"
+func resetExtractProgress(item *Extract, archives int) {
+	if item == nil {
+		return
 	}
 
-	var wrote, total uint64
-
-	if p.Total > 0 {
-		wrote, total = p.Wrote, p.Total
-	} else if p.Compressed > 0 {
-		wrote, total = p.Read, p.Compressed
+	if item.XProg == nil {
+		item.XProg = &ExtractProgress{Extract: item}
 	}
 
-	return fmt.Sprintf("on archive: %d/%d @ %sB/%sB (%.0f%%): %s",
-		p.Extracted+1, p.Archives, bytefmt.ByteSize(wrote), bytefmt.ByteSize(total),
-		p.Percent(), strings.TrimLeft(strings.TrimPrefix(p.XFile.FilePath, p.Path), string(filepath.Separator)))
+	item.XProg.ResetSpeed()
+	item.XProg.Extracted = 0
+	item.XProg.Progress = nil
+	item.XProg.Archives = archives
 }
 
 func (u *Unpackerr) progressUpdateCallback(item *Extract) func(xtractr.Progress) {
@@ -65,9 +45,23 @@ func (u *Unpackerr) handleProgress(exp *ExtractProgress) {
 
 	if exp.XProg.Progress != nil && exp.XProg.XFile != exp.XFile {
 		exp.XProg.Extracted++
+		exp.XProg.NoteArchiveDone()
 	}
 
 	exp.XProg.Progress = exp.Progress
+	exp.XProg.NoteSpeed(time.Now())
+
+	if u.hub != nil && exp.Extract != nil {
+		itemID := exp.Path
+		for name, item := range u.Map {
+			if item == exp.Extract {
+				itemID = name
+				break
+			}
+		}
+
+		u.hub.notifyProgress(u.queueFromExtract(itemID, exp.Extract))
+	}
 }
 
 func (u *Unpackerr) printProgress(now time.Time) {
@@ -80,7 +74,7 @@ func (u *Unpackerr) printProgress(now time.Time) {
 		}
 
 		if prog := data.XProg.String(); prog != "no progress yet" {
-			u.Printf("[%s] Status: %s (%v, elapsed: %v) %s", data.App, name, data.Status.Desc(),
+			u.Printf("[%s] Status: %s (%v, elapsed: %v) %s", data.Label(), name, data.Status.Desc(),
 				now.Sub(data.Updated).Round(time.Second), prog)
 		}
 	}
